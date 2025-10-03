@@ -31,7 +31,70 @@ def run_tokenize_prompt_and_output(
             "response_mask": torch.Tensor of shape (batch_size, max(prompt_and_output_lens) - 1):
                 a mask on the response tokens in `labels`.
     """
-    raise NotImplementedError
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
+
+    batch_size = len(prompt_strs)
+    '''
+        [1, 2, 3, 4, 5, 6, 7 | 8, 9, 10, 11, 12, 13, pad, pad]
+        prompt                output
+        input_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, pad]
+        labels:    [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, pad, pad]
+        mask:      [0, 0, 0, 0, 0, 0, 1, 1, 1,  1,  1,  1,  0,   0]
+    '''
+
+    # 分别对 prompt 和 output 进行分词 (不添加特殊字符，不padding)
+    prompt_tokenized = tokenizer(prompt_strs, add_special_tokens=False)
+    output_tokenized = tokenizer(output_strs, add_special_tokens=False)
+
+    # 准备拼接后的序列和掩码
+    all_full_ids = []
+    prompt_len = []
+    output_len = []
+    # 2. 遍历每个样本，手动拼接
+    '''
+        这里不能先拼接prompt和output后再进行tokenization,这样会有一些问题，比如说
+        prompt的末尾和output的开始会进行分词合并,从而导致序列变短。
+    '''
+    for i in range(len(prompt_strs)):
+        prompt_ids = prompt_tokenized.input_ids[i]
+        output_ids = output_tokenized.input_ids[i]
+        full_ids = prompt_ids + output_ids
+        all_full_ids.append(full_ids)
+        
+        prompt_len.append(len(prompt_ids))
+        output_len.append(len(output_ids))
+
+
+    max_len = max(len(ids) for ids in all_full_ids)
+
+    # 准备一个新列表，用于存放填充后的结果
+    padded_sequences = []
+    for ids in all_full_ids:
+        padding_len = max_len - len(ids)
+        padding_tokens = [tokenizer.pad_token_id] * padding_len
+        padded_seq = ids + padding_tokens
+        padded_sequences.append(padded_seq)
+
+    # 准备一个新列表，用于存放mask
+    masks = []
+    for i in range(batch_size):
+        masks.append([False]*(prompt_len[i]-1) + [True]*(output_len[i]) + \
+                     [False]*(max_len - prompt_len[i] - output_len[i]))
+
+        
+    final_padded_tensor = torch.tensor(padded_sequences, dtype=torch.long)
+    masks = torch.tensor(masks, dtype=torch.bool)
+
+    return {
+        "input_ids": final_padded_tensor[:, :-1],
+        "labels": final_padded_tensor[:, 1:],
+        "response_mask":masks,
+    }
+
+
+    
 
 
 def run_compute_group_normalized_rewards(
