@@ -1,12 +1,20 @@
 import re
 import json
 from typing import Callable, List, Dict
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from vllm import LLM, SamplingParams
 from tqdm import tqdm
 
 from drgrpo_grader import r1_zero_reward_fn
 
+def get_dataset(path):
+    data = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            data.append(json.loads(line))   # 或者如果是数组格式，用 json.load
+
+    dataset = Dataset.from_list(data)
+    return dataset
 
 
 ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
@@ -48,8 +56,8 @@ def evaluate_vllm(
 
     # 2. 遍历每个生成结果进行评估
     for i, output in enumerate(tqdm(model_outputs, desc="Evaluating")):
-        prompt_text = output.prompt
         generated_text = output.outputs[0].text.strip()
+        generated_text += "</answer>"
         ground_truth_answer = answers[i]
         ground_truth_answer = extract_reference_answer(ground_truth_answer)
 
@@ -70,20 +78,14 @@ def evaluate_vllm(
         if score_dict.get('answer_reward', 0.0) == 1.0:
             total_answer_correct += 1
             
-        # 4. 将该样本的详细信息存入结果列表
-        results.append({
-            "prompt": prompt_text,
-            "question": prompts[i], # 原始问题
-            "generated_text": generated_text,
-            "ground_truth": ground_truth_answer,
-            "scores": score_dict
-        })
 
         
     # 5. 计算整体评估指标（准确率）
     reward_accuracy = total_correct / len(prompts) if prompts else 0.0
     format_accuracy = total_format_correct / len(prompts) if prompts else 0.0
     answer_accuracy = total_answer_correct / len(prompts) if prompts else 0.0
+
+    print(outputs[:2])
 
     print("\nEvaluate end")
     print(f"格式和答案都正确率: {reward_accuracy:.4f} ({total_correct}/{len(prompts)})")
@@ -105,17 +107,16 @@ if __name__ == "__main__":
 
     llm = LLM(model=MODEL_PATH, trust_remote_code=True, enforce_eager=True)
 
-    dataset = load_dataset("json", data_files=DATASET_PATH)
-    dataset = dataset['train']
-   
-    prompts = [format_prompt(item['question']) for item in dataset]
-    answers = [item['answer'] for item in dataset]
+    test_dataset = get_dataset(DATASET_PATH)
+
+    test_prompts = [format_prompt(item['question']) for item in test_dataset]
+    test_answers = [item['answer'] for item in test_dataset]
 
 
     evaluate_vllm(
         vllm_model=llm,
         reward_fn=r1_zero_reward_fn, # 传入为GSM8K定制的奖励函数
-        prompts=prompts,
-        answers=answers,
+        prompts=test_prompts,
+        answers=test_answers,
         eval_sampling_params=sampling_params,
     )
