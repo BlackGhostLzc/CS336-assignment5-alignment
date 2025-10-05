@@ -10,6 +10,7 @@ from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 import json
 import re
+import argparse
 from drgrpo_grader import r1_zero_reward_fn
 
 from math_baseline import evaluate_vllm, format_prompt
@@ -37,7 +38,7 @@ N_SFT_STEPS = 100              # 总共进行多少轮专家迭代
 NUM_ROLLOUTS = 1             # G, 每个问题生成多少个候选回答
 
 # SFT 训练配置
-EPOCHS_PER_SFT_STEP = 1      # 在筛选出的新数据集上训练几轮
+EPOCHS_PER_SFT_STEP = 2      # 在筛选出的新数据集上训练几轮
 BATCH_SIZE = 1
 LR = 1e-5
 GRADIENT_ACCUMULATION_STEPS = 64
@@ -88,6 +89,17 @@ def r1_zero_template(prompts: list[str], outputs: list[str]) -> tuple[list[str],
 
 
 def main():
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--train_size",
+        type=int,
+        default=-1,
+        help="Use a random subset of the training data. If not specified or -1, use the full dataset."
+    )
+    args = parser.parse_args()
+
+
     print("--- (Expert Iteration Experiment Start) ---")
 
     # 1. 初始化模型、分词器和优化器
@@ -106,6 +118,12 @@ def main():
     print("Loading datasets...")
     train_dataset = get_dataset(TRAIN_DATA_PATH)
     test_dataset = get_dataset(TEST_DATA_PATH)
+    # 只选取部分数据集
+    train_size = args.train_size
+    if train_size > 0:
+        # 确保子集大小不超过原始数据集大小
+        size = min(train_size, len(train_dataset))
+        train_dataset = train_dataset.shuffle(seed=42).select(range(size))
     
     test_prompts = [format_prompt(item['question']) for item in test_dataset]
     test_ground_truth_answers = [item['answer'] for item in test_dataset]
@@ -135,6 +153,7 @@ def main():
         generation_prompts = []
         original_questions = []
         original_answers = []
+        
         for item in train_dataset:
             prompt = format_prompt(item['question'])
             generation_prompts.extend([prompt] * NUM_ROLLOUTS)

@@ -11,6 +11,7 @@ from vllm.model_executor import set_random_seed as vllm_set_random_seed
 import json
 import re
 from drgrpo_grader import r1_zero_reward_fn
+import argparse
 
 from math_baseline import evaluate_vllm, format_prompt
 
@@ -33,8 +34,8 @@ temp_cache_dir = "/home/lzc/tmp/cache"
 # 训练超参数
 EPOCHS = 10
 LR = 1e-5
-BATCH_SIZE = 4
-GRADIENT_ACCUMULATION_STEPS = 8 # 模拟的总批次大小为 4 * 8 = 32
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 32 # 模拟的总批次大小为 4 * 8 = 32
 SEED = 42
 
 
@@ -46,7 +47,7 @@ log_generations:
 在训练的“循环中 (in-the-loop)”定期地用模型生成一些样本，并将生成结果、评估分数等关键信息打印或记录下来，以供人工检查和分析。
 '''
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.6):
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.3):
     """
         Start the inference process, here we use vLLM to hold a model on
         a GPU separate from the policy.
@@ -65,10 +66,19 @@ def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: flo
         "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
         return_value=None
     )
-    with world_size_patch, profiling_patch:
+    # with world_size_patch, profiling_patch:
+    #     return LLM(
+    #         model=model_id,
+    #         # device=device,
+    #         tensor_parallel_size=1,
+    #         dtype=torch.bfloat16,
+    #         enable_prefix_caching=True,
+    #         gpu_memory_utilization=gpu_memory_utilization,
+    #     )
+    with patch("torch.distributed.get_world_size", return_value=1):
         return LLM(
             model=model_id,
-            device=device,
+            tensor_parallel_size=1,
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
             gpu_memory_utilization=gpu_memory_utilization,
@@ -173,6 +183,16 @@ def r1_zero_template(
 def main():
     # config_wandb()
 
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--train_size",
+        type=int,
+        default=-1,
+        help="Use a random subset of the training data. If not specified or -1, use the full dataset."
+    )
+    args = parser.parse_args()
+
+
     # 加载主模型（策略模型）和分词器到训练GPU
     print(f"Loading policy model and tokenizer to {TRAIN_GPU}...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
@@ -180,6 +200,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     policy_model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to(TRAIN_GPU)
     optimizer = torch.optim.Adam(policy_model.parameters(), lr=LR)
+    # optimizer = torch.optim.SGD(policy_model.parameters(), lr=LR)
 
     # 初始化 vLLM 实例到评估GPU
     print(f"Initializing vLLM on {EVAL_GPU}...")
@@ -194,6 +215,14 @@ def main():
 
     train_dataset = get_dataset(TRAIN_DATA_PATH)
     test_dataset = get_dataset(TEST_DATA_PATH)
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
+
+    train_size = args.train_size
+    if train_size > 0:
+        # 确保子集大小不超过原始数据集大小
+        size = min(train_size, len(train_dataset))
+        train_dataset = train_dataset.shuffle(seed=42).select(range(size))
+
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
 
     train_step = 0
@@ -231,16 +260,24 @@ def main():
                 train_step = 0
                 step_loss = 0
 
-        
+        policy_model.save_pretrained("/home/lzc/model.pth")
 
         policy_model.eval() # 切换到评估模式
         load_policy_into_vllm_instance(policy_model, llm_eval_instance)
+
+
 
         test_prompts = [format_prompt(item['question']) for item in test_dataset]
         test_answers = [item['answer'] for item in test_dataset]
 
         evaluate_vllm(llm_eval_instance, r1_zero_reward_fn, test_prompts, test_answers, sampling_params)
+        
 
+
+# 
+# 1. 样本数 {128, 256, 512, 1024}, along with using the full dataset. 
+# 2. wandb 追踪
+# 3. log_generations
 
 
 if __name__ == "__main__":

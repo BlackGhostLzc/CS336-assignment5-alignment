@@ -238,3 +238,12 @@ def sft_microbatch_train_step(
     metadata = {'loss': scaled_loss.detach()}
 
     return scaled_loss.detach(), metadata
+
+
+
+
+
+
+
+
+########################################### GRPO ################################################

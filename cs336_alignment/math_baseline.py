@@ -57,7 +57,7 @@ def evaluate_vllm(
     # 2. 遍历每个生成结果进行评估
     for i, output in enumerate(tqdm(model_outputs, desc="Evaluating")):
         generated_text = output.outputs[0].text.strip()
-        generated_text += "</answer>"
+        generated_text += "</answer>"             # 这一行很重要，因为sampling中不会把</answer>添加到输出中
         ground_truth_answer = answers[i]
         ground_truth_answer = extract_reference_answer(ground_truth_answer)
 
@@ -85,12 +85,12 @@ def evaluate_vllm(
     format_accuracy = total_format_correct / len(prompts) if prompts else 0.0
     answer_accuracy = total_answer_correct / len(prompts) if prompts else 0.0
 
-    print(outputs[:2])
 
     print("\nEvaluate end")
     print(f"格式和答案都正确率: {reward_accuracy:.4f} ({total_correct}/{len(prompts)})")
     print(f"格式正确率: {format_accuracy:.4f} ({total_format_correct}/{len(prompts)})")
     print(f"答案正确率: {answer_accuracy:.4f} ({total_answer_correct}/{len(prompts)})")
+
 
 
 if __name__ == "__main__":
