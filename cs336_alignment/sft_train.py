@@ -5,7 +5,7 @@ from tqdm import tqdm
 from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedModel
 from torch.utils.data import DataLoader
-from unittest.mock import patch
+
 from vllm import LLM, SamplingParams
 from vllm.model_executor import set_random_seed as vllm_set_random_seed
 import json
@@ -15,12 +15,7 @@ import argparse
 
 from math_baseline import evaluate_vllm, format_prompt
 
-from common import (
-    tokenize_prompt_and_output,
-    get_response_log_probs,
-    sft_microbatch_train_step,
-)
-
+from common import *
 
 
 # --- 配置参数 ---
@@ -47,52 +42,7 @@ log_generations:
 在训练的“循环中 (in-the-loop)”定期地用模型生成一些样本，并将生成结果、评估分数等关键信息打印或记录下来，以供人工检查和分析。
 '''
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.3):
-    """
-        Start the inference process, here we use vLLM to hold a model on
-        a GPU separate from the policy.
-    """
-    vllm_set_random_seed(seed)
-
-    # Monkeypatch from TRL:
-    # https://github.com/huggingface/trl/blob/
-    # 22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py
-    # Patch vLLM to make sure we can
-    # (1) place the vLLM model on the desired device (world_size_patch) and
-    # (2) avoid a test that is not designed for our setting (profiling_patch).
-
-    world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch(
-        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
-        return_value=None
-    )
-    # with world_size_patch, profiling_patch:
-    #     return LLM(
-    #         model=model_id,
-    #         # device=device,
-    #         tensor_parallel_size=1,
-    #         dtype=torch.bfloat16,
-    #         enable_prefix_caching=True,
-    #         gpu_memory_utilization=gpu_memory_utilization,
-    #     )
-    with patch("torch.distributed.get_world_size", return_value=1):
-        return LLM(
-            model=model_id,
-            tensor_parallel_size=1,
-            dtype=torch.bfloat16,
-            enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization,
-        )
     
-
-def load_policy_into_vllm_instance(policy: PreTrainedModel, llm: LLM):
-    """
-        Copied from https://github.com/huggingface/trl/blob/
-        22759c820867c8659d00082ba8cf004e963873c1/trl/trainer/grpo_trainer.py#L670.
-    """
-    state_dict = policy.state_dict()
-    llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
-    llm_model.load_weights(state_dict.items())
 
 
 def config_wandb():
@@ -105,78 +55,6 @@ def config_wandb():
     wandb.define_metric("train/*", step_metric="train_step")
     wandb.define_metric("eval/*", step_metric="eval_step")
 
-
-
-def get_dataset(path):
-    data = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            data.append(json.loads(line))   # 或者如果是数组格式，用 json.load
-
-    dataset = Dataset.from_list(data)
-    return dataset
-
-
-
-ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
-
-def extract_reasoning_and_answer(full_answer: str) -> tuple[str, str]:
-    """
-    将包含推理和答案的字符串分割成两部分。
-
-    Args:
-        full_answer: 包含推理过程和以 "####" 标记的答案的完整字符串。
-
-    Returns:
-        一个元组，包含两个元素：
-        - reasoning (str): 推理过程部分。
-        - answer (str): 提取并清洗后的数字答案。
-        如果找不到答案标记，则将整个输入字符串视为 reasoning，answer 返回 "[invalid]"。
-    """
-    # 使用 "####" 进行分割，取第一部分作为推理过程
-    # 使用 .split('####', 1) 可以确保只分割一次，更稳健
-    parts = full_answer.split('####', 1)
-    
-    if len(parts) == 2:
-        reasoning = parts[0].strip()
-        # 对第二部分（可能包含答案）使用正则表达式进行精确匹配
-        match = ANS_RE.search(full_answer)
-        if match:
-            # 提取并清理答案
-            answer = match.group(1).strip().replace(",", "")
-            return reasoning, answer
-
-    # 如果没有找到 "####" 或正则表达式不匹配，则返回整个字符串和无效标记
-    return full_answer.strip(), "[invalid]"
-
-
-
-
-def r1_zero_template(
-    prompts: list[str],
-    outputs: list[str]
-) -> tuple[list[str], list[str]]:
-    SYSTEM_MESSAGE = (
-        "A conversation between User and Assistant. The User asks a question, and the Assistant solves it. "
-        "The Assistant first thinks about the reasoning process in the mind and then provides the User with the answer. "
-        "The reasoning process is enclosed within <think> </think> and answer is enclosed within <answer> </answer> tags, "
-        "respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>."
-    )
-    formatted_prompts = []
-    formatted_responses = []
-
-    for prompt, output in zip(prompts, outputs):
-        formatted_prompt = f"{SYSTEM_MESSAGE}\nUser: {prompt}\nAssistant: <think>"
-
-        # 找到 output 中的答案和推理过程
-        reasoning, answer = extract_reasoning_and_answer(output)
-        formatted_response = f"{reasoning}</think> <answer>{answer}</answer>"  # </think> <answer> 之间的空格很重要，r1_zero_reward_fn格式
-
-        formatted_prompts.append(formatted_prompt)
-        formatted_responses.append(formatted_response)
-
-    return (formatted_prompts, formatted_responses)
-    
 
 
 
@@ -200,7 +78,6 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     policy_model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype=torch.bfloat16).to(TRAIN_GPU)
     optimizer = torch.optim.Adam(policy_model.parameters(), lr=LR)
-    # optimizer = torch.optim.SGD(policy_model.parameters(), lr=LR)
 
     # 初始化 vLLM 实例到评估GPU
     print(f"Initializing vLLM on {EVAL_GPU}...")
@@ -223,7 +100,6 @@ def main():
         size = min(train_size, len(train_dataset))
         train_dataset = train_dataset.shuffle(seed=42).select(range(size))
 
-    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE)
 
     train_step = 0
     step_loss = 0
